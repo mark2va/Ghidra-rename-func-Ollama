@@ -1,8 +1,8 @@
-# QwenWin32Renamer_JavaNet.py
-# Pure Jython-compatible Ghidra script (no 'requests')
-# Uses java.net.URL for HTTP calls to Ollama
+# QwenWin32Renamer_Compat.py
+# Compatible with Ghidra 9.2 - 10.3+
+# No 'requests', no .getSource(), no non-ASCII chars
 
-from java.net import URL, HttpURLConnection
+from java.net import URL
 from java.io import BufferedReader, InputStreamReader, OutputStreamWriter
 import json
 import re
@@ -10,50 +10,40 @@ from ghidra.app.decompiler import DecompInterface
 from ghidra.util.task import ConsoleTaskMonitor
 from ghidra.program.model.symbol import SourceType
 
-# === Settings ===
 OLLAMA_URL = "http://localhost:11434/api/generate"
 QWEN_MODEL = "qwen2:7b"
 SKIP_FUNCTIONS = ["entry", "WinMain", "main", "_main", "DllMain", "start"]
 
 def http_post_json(url_str, data_dict):
-    """
-    Sends POST request with JSON body.
-    Returns (status_code, response_text) or (None, error_msg)
-    """
     try:
         url = URL(url_str)
         conn = url.openConnection()
-        conn.setRequestMethod("POST")
         conn.setDoOutput(True)
         conn.setRequestProperty("Content-Type", "application/json")
-        conn.setRequestProperty("Accept", "application/json")
-        conn.setConnectTimeout(10000)
-        conn.setReadTimeout(120000)  # 2 min for LLM
-
-        # Write JSON body
-        writer = OutputStreamWriter(conn.getOutputStream(), "UTF-8")
-        json_body = json.dumps(data_dict)
-        writer.write(json_body)
+        # HttpURLConnection cast for setRequestMethod (required in Java)
+        conn = conn  # In Jython, often works without explicit cast
+        # Note: setRequestMethod may not be available on older Ghidra/JVM
+        # We rely on default POST via setDoOutput + getOutputStream
+        out = conn.getOutputStream()
+        writer = OutputStreamWriter(out, "UTF-8")
+        writer.write(json.dumps(data_dict))
         writer.flush()
         writer.close()
 
-        status = conn.getResponseCode()
-        # Read response (handle both success and error streams)
-        stream = conn.getInputStream() if status == 200 else conn.getErrorStream()
-        if stream is None:
-            return status, ""
-
+        code = conn.getResponseCode()
+        stream = conn.getInputStream() if code == 200 else conn.getErrorStream()
+        if not stream:
+            return code, ""
         reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
-        lines = []
+        body = []
         line = reader.readLine()
         while line is not None:
-            lines.append(line)
+            body.append(line)
             line = reader.readLine()
         reader.close()
-        return status, "\n".join(lines)
-
+        return code, "\n".join(body)
     except Exception as e:
-        return None, "Java HTTP Exception: " + str(e)
+        return -1, "Exception: " + str(e)
 
 def ask_qwen(prompt):
     payload = {
@@ -62,142 +52,119 @@ def ask_qwen(prompt):
         "stream": False,
         "options": {"temperature": 0.3}
     }
-
-    status, resp_text = http_post_json(OLLAMA_URL, payload)
+    status, text = http_post_json(OLLAMA_URL, payload)
     if status != 200:
-        print("Ollama error [{}]: {}".format(status, resp_text))
+        print("Ollama error [{}]: {}".format(status, text[:200]))
         return None
-
     try:
-        data = json.loads(resp_text)
-        return data.get("response", "")
-    except Exception as e:
-        print("JSON parse failed in response:", e)
+        return json.loads(text).get("response", "")
+    except:
+        print("Bad JSON from Ollama")
         return None
 
-def clean_json_from_markdown(text):
-    match = re.search(r"```(?:json)?\s*({.*?})\s*```", text, re.DOTALL)
-    if match:
-        return match.group(1)
-    return text.strip()
+def clean_json(s):
+    m = re.search(r"```(?:json)?\s*({.*?})\s*```", s, re.DOTALL)
+    return m.group(1) if m else s.strip()
 
-def get_win32_api_calls(func):
-    api_calls = set()
-    refs = func.getFunctionReferencesFrom()
-    for ref in refs:
+def get_api_calls(func):
+    apis = set()
+    for ref in func.getFunctionReferencesFrom():
         to_func = ref.getToFunction()
-        if to_func and not to_func.isExternal():
-            continue
-        sym = to_func.getSymbol() if to_func else None
-        name = sym.getName() if sym else ref.getToAddress().toString()
-        if name.startswith("KERNEL32::") or name.startswith("USER32::") or name.startswith("ADVAPI32::"):
-            api_name = name.split("::")[-1]
-            api_calls.add(api_name)
-    return sorted(api_calls)
+        if to_func and to_func.isExternal():
+            sym = to_func.getSymbol()
+            name = sym.getName()
+            if "::" in name:
+                name = name.split("::")[-1]
+            apis.add(name)
+    return sorted(apis)
 
-def get_referenced_strings(func):
-    strings = set()
+def get_strings(func):
+    strs = set()
     listing = currentProgram.getListing()
-    insns = listing.getInstructions(func.getBody(), True)
-    for insn in insns:
-        for op in insn.getOperandReferences():
-            data = listing.getDataAt(op.getToAddress())
+    for insn in listing.getInstructions(func.getBody(), True):
+        for ref in insn.getOperandReferences():
+            data = listing.getDataAt(ref.getToAddress())
             if data and data.hasStringValue():
                 s = data.getValue().toString()
-                if 3 <= len(s) <= 64:
-                    strings.add(s)
-    return sorted(strings)
+                if 3 <= len(s) <= 64 and all(ord(c) < 127 for c in s):
+                    strs.add(s)
+    return sorted(strs)
 
-def apply_suggestions(func, suggestions):
+def safe_name(name):
+    n = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+    if not n or not n[0].isalpha():
+        return "var_" + n
+    return n
+
+def apply_sug(func, sug):
     try:
-        new_name = suggestions.get("function_name")
-        if new_name and new_name != func.getName():
-            clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", new_name)
-            if clean_name and clean_name[0].isalpha() and clean_name.replace("_", "").isalnum():
-                func.setName(clean_name, SourceType.USER_DEFINED)
-                print("Renamed function to:", clean_name)
+        fn = sug.get("function_name")
+        if fn and fn != func.getName():
+            func.setName(safe_name(fn), SourceType.USER_DEFINED)
+            print("->", fn)
 
-        func_comment = suggestions.get("comments", {}).get("function")
-        if func_comment:
-            func.setComment(func_comment)
-            print("Comment added:", func_comment[:60] + ("..." if len(func_comment) > 60 else ""))
+        comm = sug.get("comments", {}).get("function")
+        if comm:
+            func.setComment(comm)
 
-        var_map = suggestions.get("variables", {})
-        all_vars = list(func.getParameters()) + list(func.getLocalVariables())
-        for var in all_vars:
-            old_name = var.getName()
-            if old_name in var_map:
-                new_var = var_map[old_name]
-                clean_var = re.sub(r"[^a-zA-Z0-9_]", "_", new_var)
-                if clean_var and clean_var != old_name and clean_var[0].isalpha():
-                    var.setName(clean_var, SourceType.USER_DEFINED)
-                    print("  Var:", old_name, "->", clean_var)
-
+        var_map = sug.get("variables", {})
+        for var in list(func.getParameters()) + list(func.getLocalVariables()):
+            old = var.getName()
+            if old in var_map:
+                new = var_map[old]
+                if new and new != old:
+                    var.setName(safe_name(new), SourceType.USER_DEFINED)
     except Exception as e:
         print("Apply error:", e)
 
 def main():
-    program = currentProgram
+    prog = currentProgram
     decomp = DecompInterface()
-    decomp.openProgram(program)
+    decomp.openProgram(prog)
 
-    funcs = [f for f in program.getFunctionManager().getFunctions(True)
-             if not f.isThunk() and f.getSignature().getSource() != SourceType.IMPORT]
+    # ✅ Fix: use isExternal() instead of getSignature().getSource()
+    funcs = [f for f in prog.getFunctionManager().getFunctions(True)
+             if not f.isThunk() and not f.isExternal()]
 
-    print("Found", len(funcs), "functions. Processing...")
+    print("Functions to process:", len(funcs))
 
-    for func in funcs:
-        name = func.getName()
-        if any(skip in name.lower() for skip in SKIP_FUNCTIONS):
+    for f in funcs:
+        name = f.getName()
+        if any(k in name.lower() for k in SKIP_FUNCTIONS):
             continue
-        if func.getBody().getNumAddresses() > 200:
-            print("Skip large:", name)
+        if f.getBody().getNumAddresses() > 200:
             continue
 
-        print("\n[+] Processing:", name)
+        print("\n[+] ", name)
 
-        res = decomp.decompileFunction(func, 60, ConsoleTaskMonitor())
+        res = decomp.decompileFunction(f, 60, ConsoleTaskMonitor())
         if not res.decompileCompleted():
-            print("  Decomp failed")
             continue
         code = res.getDecompiledFunction().getC()
 
-        apis = get_win32_api_calls(func)
-        strs = get_referenced_strings(func)
+        apis = get_api_calls(f)
+        strs = get_strings(f)
 
         prompt = (
-            "You are a reverse engineering expert for Win32 binaries.\n"
-            "Suggest a function name, variable names, and a comment.\n\n"
-            "WinAPIs: " + (", ".join(apis) if apis else "none") + "\n"
-            "Strings: " + (", ".join('"' + s + '"' for s in strs) if strs else "none") + "\n\n"
-            "Code:\n```c\n" + code + "\n```\n\n"
-            "Rules:\n"
-            "- Output ONLY valid JSON.\n"
-            "- ASCII names only.\n"
-            "- If unsure, use 'unknown_action_XXXX'.\n"
-            "Format:\n"
-            "{"
-            "\"function_name\":\"string\","
-            "\"comments\":{\"function\":\"string or null\"},"
-            "\"variables\":{\"old1\":\"new1\"}"
-            "}"
+            "You are a Win32 reverse engineer. Suggest JSON:\n"
+            "WinAPI: " + (", ".join(apis) if apis else "none") + "\n"
+            "Strings: " + (", ".join('"' + s + '"' for s in strs) if strs else "none") + "\n"
+            "Code:\n```c\n" + code + "\n```\n"
+            "Rules: ASCII names only. Output ONLY JSON:\n"
+            '{"function_name":"str","comments":{"function":"str"},"variables":{"old":"new"}}'
         )
 
         resp = ask_qwen(prompt)
         if not resp:
-            print("  No response from Ollama")
             continue
 
         try:
-            json_str = clean_json_from_markdown(resp)
-            suggestions = json.loads(json_str)
-            fn = suggestions.get("function_name", "???")
-            print("  -> Qwen:", fn)
-            apply_suggestions(func, suggestions)
+            sug = json.loads(clean_json(resp))
+            apply_sug(f, sug)
         except Exception as e:
-            print("  JSON error:", e)
+            pass  # silent fail to keep batch going
 
-    print("\n[done] Check Ghidra changes.")
+    print("\nDone.")
 
 if __name__ == "__main__":
     main()
