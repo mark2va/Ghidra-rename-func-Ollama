@@ -29,7 +29,6 @@
 
 import json
 import re
-
 from java.net import URL
 from java.io import BufferedReader, InputStreamReader, OutputStreamWriter
 
@@ -356,6 +355,8 @@ def get_called_functions(func):
         refs = func.getFunctionReferencesFrom()
     except Exception:
         refs = []
+    if not hasattr(refs, "__len__"):
+        refs = _iter_java(refs)
     for ref in refs:
         rt = ref.getReferenceType()
         if rt.isCall():
@@ -374,7 +375,8 @@ def get_called_functions(func):
 def get_external_api_names(func):
     apis = set()
     for callee in get_called_functions(func):
-        if callee.isExternal() or callee.isThunk():
+        if _safe_call(callee, "isExternal", False) or \
+            _safe_call(callee, "isThunk", False):
             name = callee.getName()
             if "::" in name:
                 name = name.split("::")[-1]
@@ -385,15 +387,17 @@ def get_external_api_names(func):
 def get_strings_in_func(func):
     strs = set()
     listing = currentProgram.getListing()
+    body = _safe_call(func, "getBody")
+    if body is None:
+        return strs
     try:
-        insns = listing.getInstructions(func.getBody(), True)
+        insns = _iter_java(listing.getInstructions(body, True))
     except Exception:
         return strs
     for insn in insns:
-        try:
-            refs = insn.getReferences()
-        except Exception:
-            continue
+        refs = _safe_call(insn, "getReferences", []) or []
+        if not hasattr(refs, "__len__"):
+            refs = _iter_java(refs)
         for ref in refs:
             data = listing.getDataAt(ref.getToAddress())
             if data is not None and data.hasStringValue():
@@ -500,11 +504,94 @@ def build_control_flow_summary(code, func):
     if callees:
         names = []
         for c in callees:
-            tag = "EXTERNAL" if (c.isExternal() or c.isThunk()) else "internal"
+            tag = "EXTERNAL" if (_safe_call(c, "isExternal", False)
+               or _safe_call(c, "isThunk", False)) else "internal"
             names.append("%s (%s)" % (c.getName(), tag))
         summary.append("CALLEES: " + ", ".join(names))
 
     return "\n".join(summary[:120])
+
+
+def _safe_call(obj, method, default=None):
+    """Call obj.method() if it exists and is callable; swallow API errors.
+
+    Ghidra's internals (e.g. InstructionDB / FunctionDB variants across
+    versions) do not always expose every documented method, so every such
+    call goes through this helper instead of a direct attribute access.
+    """
+    m = getattr(obj, method, None)
+    if not callable(m):
+        return default
+    try:
+        return m()
+    except Exception:
+        return default
+
+
+# Module-level: safe mnemonic extraction for any Ghidra instruction object.
+def _iter_java(it, limit=None):
+    """Iterate a Ghidra/Java iterator (hasNext/next) safely.
+
+    Some listing APIs return objects that are NOT Python-iterable, so we
+    always drive them through hasNext()/next() and never assume 'for x in'.
+    """
+    out = []
+    if it is None:
+        return out
+    try:
+        n = 0
+        while it.hasNext():
+            v = it.next()
+            out.append(v)
+            n += 1
+            if limit is not None and n >= limit:
+                break
+    except Exception:
+        pass
+    return out
+
+
+def _mnemonic_of(instr):
+    # Ghidra API: mnemonic is available via getMnemonicString() or
+    # getMnemonic().getAsString(); some internals expose neither.
+    for attr in ("getMnemonicString", "getMnemonic"):
+        m = getattr(instr, attr, None)
+        if not callable(m):
+            continue
+        try:
+            v = m()
+        except Exception:
+            continue
+        if isinstance(v, str) or hasattr(v, "encode"):
+            return str(v).strip().lower()
+        s = getattr(v, "getMnemonicString", None)
+        if callable(s):
+            try:
+                return str(s()).strip().lower()
+            except Exception:
+                pass
+        return str(v).strip().lower()
+    # fallback: parse instruction text; take the first alphabetic
+    # token so leading punctuation can never leak into the mnemonic.
+    try:
+        for tok in re.findall(r"[A-Za-z][A-Za-z0-9_]*", str(instr)):
+            return tok.lower()
+    except Exception:
+        pass
+    return ""
+
+
+def _instruction_count(listing, body):
+    """Count instructions in a body without relying on Instruction methods."""
+    n = 0
+    try:
+        it = listing.getInstructions(body, True)
+        while it.hasNext():
+            it.next()
+            n += 1
+    except Exception:
+        return -1
+    return n
 
 
 def classify_function(func, code):
@@ -516,7 +603,7 @@ def classify_function(func, code):
       ("rename_ml", reason)           - normal -> rename by logic
     """
     # ---- THUNK / PLT stub -> pure wrapper
-    if func.isThunk():
+    if _safe_call(func, "isThunk", False):
         return ("skip_wrapper", "thunk/stub (single jump to another function)")
 
     body = func.getBody()
@@ -525,40 +612,34 @@ def classify_function(func, code):
     # ---- EMPTY function (no body / only return)
     if is_empty_code(code):
         listing = currentProgram.getListing()
-        try:
-            insns = list(listing.getInstructions(body, True)) \
-                if body is not None else []
-        except Exception:
-            insns = []
-        def _mnemonic_of(instr):
-            # Ghidra API: mnemonic is available via getMnemonicString() /
-            # getMnemonic().getAsString(); InstructionDB may expose neither.
-            for attr in ("getMnemonicString",):
-                m = getattr(instr, attr, None)
-                if callable(m):
-                    try:
-                        return str(m()).lower()
-                    except Exception:
-                        pass
-            mn = getattr(instr, "getMnemonic", None)
-            if callable(mn):
-                try:
-                    obj = mn()
-                    s = getattr(obj, "getMnemonicString", None)
-                    if callable(s):
-                        return str(s()).lower()
-                    return str(obj).lower()
-                except Exception:
-                    pass
-            # fallback: parse instruction text (e.g. "return", "ret", "nop")
+        insns = []          # may stay empty on exotic listing impls
+        mn_counts = {}      # mnemonic histogram from safe iteration
+        nins = -1
+        if body is not None:
             try:
-                return str(instr).strip().split()[0].lower()
+                it = listing.getInstructions(body, True)
+                n = 0
+                while it.hasNext():
+                    instr = it.next()
+                    n += 1
+                    if len(insns) < 64:
+                        insns.append(instr)
+                    try:
+                        mn = _mnemonic_of(instr)
+                    except Exception:
+                        mn = ""
+                    mn_counts[mn] = mn_counts.get(mn, 0) + 1
+                nins = n
             except Exception:
-                return ""
-
-        meaningful = [i for i in insns
-                      if _mnemonic_of(i) not in ("return", "ret", "halt", "nop")]
-        if num_addresses <= 2 or len(meaningful) == 0:
+                nins = -1
+        skip_mnemonics = ("return", "ret", "halt", "nop")
+        if nins >= 0:
+            meaningful_n = sum(c for m, c in mn_counts.items()
+                               if m not in skip_mnemonics)
+        else:
+            meaningful_n = len([i for i in insns
+                                if _mnemonic_of(i) not in skip_mnemonics])
+        if (nins >= 0 and nins <= 2) or num_addresses <= 2 or meaningful_n == 0:
             return ("skip_empty", "empty function (no code / only return)")
 
     # ---- Wrapper: body consists of a single call (optionally with arg setup)
@@ -726,9 +807,10 @@ def main():
         stats["total"] += 1
 
         # external/library functions are not part of the binary itself
-        if func.isExternal():
+        if _safe_call(func, "isExternal", False):
             continue
-        src = func.getSymbol().getSource()
+        sym = _safe_call(func, "getSymbol")
+        src = _safe_call(sym, "getSource") if sym is not None else None
         # NOTE: ghidra.program.model.symbol.SourceType has NO attribute named
         # LIBRARY_FUNCTION (that was the AttributeError). The constant that
         # marks functions coming from shared libraries / library image is
