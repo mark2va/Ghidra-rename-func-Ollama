@@ -530,9 +530,34 @@ def classify_function(func, code):
                 if body is not None else []
         except Exception:
             insns = []
+        def _mnemonic_of(instr):
+            # Ghidra API: mnemonic is available via getMnemonicString() /
+            # getMnemonic().getAsString(); InstructionDB may expose neither.
+            for attr in ("getMnemonicString",):
+                m = getattr(instr, attr, None)
+                if callable(m):
+                    try:
+                        return str(m()).lower()
+                    except Exception:
+                        pass
+            mn = getattr(instr, "getMnemonic", None)
+            if callable(mn):
+                try:
+                    obj = mn()
+                    s = getattr(obj, "getMnemonicString", None)
+                    if callable(s):
+                        return str(s()).lower()
+                    return str(obj).lower()
+                except Exception:
+                    pass
+            # fallback: parse instruction text (e.g. "return", "ret", "nop")
+            try:
+                return str(instr).strip().split()[0].lower()
+            except Exception:
+                return ""
+
         meaningful = [i for i in insns
-                      if str(i.getMnemonic()).lower()
-                      not in ("return", "ret", "halt", "nop")]
+                      if _mnemonic_of(i) not in ("return", "ret", "halt", "nop")]
         if num_addresses <= 2 or len(meaningful) == 0:
             return ("skip_empty", "empty function (no code / only return)")
 
