@@ -550,9 +550,12 @@ def classify_function(func, code):
                     return str(obj).lower()
                 except Exception:
                     pass
-            # fallback: parse instruction text (e.g. "return", "ret", "nop")
+            # fallback: parse instruction text (e.g. "return", "ret", "nop").
+            # Split on any non-identifier char so no leading punctuation can
+            # leak into the mnemonic (defensive against exotic toString()).
             try:
-                return str(instr).strip().split()[0].lower()
+                toks = re.split(r"[^A-Za-z0-9_]+", str(instr).strip())
+                return toks[0].lower() if toks and toks[0] else ""
             except Exception:
                 return ""
 
