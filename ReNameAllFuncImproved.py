@@ -645,6 +645,30 @@ def add_mlwl_marker_comment(func, reason):
 
 
 # ================================ Main =====================================
+
+def _is_library_source(src):
+    """
+    Return True if the function SourceType marks a library/shared-library
+    function. Different Ghidra versions expose different enum names, and
+    'LIBRARY_FUNCTION' does NOT exist (using it raises AttributeError), so
+    we resolve constants dynamically:
+      - LIBRARY          (exists in all recent Ghidra versions)
+      - SHARED_LIBRARY   (older Ghidra versions)
+    Comparison is done by both identity and name for maximum robustness.
+    """
+    lib_names = ("LIBRARY", "SHARED_LIBRARY")
+    for attr in lib_names:
+        const = getattr(SourceType, attr, None)
+        if const is not None and src == const:
+            return True
+    try:
+        if str(src) in lib_names:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def main():
     print("=" * 60)
     print("LLM function renamer (control-flow aware, MLW marking)")
@@ -680,7 +704,12 @@ def main():
         if func.isExternal():
             continue
         src = func.getSymbol().getSource()
-        if src == SourceType.LIBRARY_FUNCTION:
+        # NOTE: ghidra.program.model.symbol.SourceType has NO attribute named
+        # LIBRARY_FUNCTION (that was the AttributeError). The constant that
+        # marks functions coming from shared libraries / library image is
+        # SourceType.LIBRARY. We resolve it defensively so the script works
+        # on every Ghidra version regardless of enum naming changes.
+        if _is_library_source(src):
             continue
         # already renamed by the analyst (e.g. via ReNameFunc.py or a previous
         # pass of this script) -> skip; its meaningful name is on the graph
